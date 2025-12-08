@@ -10,6 +10,9 @@ use std::thread;
 use std::time::Duration;
 use std::str::FromStr;
 use actix_web::{web, App, HttpServer, HttpResponse};
+use maxminddb::{geoip2, Reader};
+use once_cell::sync::Lazy;
+use std::sync::Mutex;
 
 // 导入 Diesel 生成的 schema（需按前版步骤生成）
 mod schema;
@@ -43,6 +46,14 @@ struct Cli {
     /// 启用 Prometheus exporter（默认端口：9090）
     #[arg(short = 'p', long, help = "启用 Prometheus exporter 监听端口")]
     prometheus_port: Option<u16>,
+
+    /// GeoIP2 数据库文件路径（可选，用于 IP 地理位置查询）
+    #[arg(short = 'g', long, help = "GeoIP2 City 数据库文件路径，例如：GeoLite2-City.mmdb")]
+    geoip_db: Option<String>,
+
+    /// Prometheus metrics 流量阈值（单位：字节，默认 1MB）
+    #[arg(short = 't', long, default_value_t = 1024 * 1024, help = "低于此阈值的流量不会导出到 Prometheus")]
+    prometheus_export_threshold: i64,
 }
 
 // ==================== ORM 模型 ====================
@@ -66,15 +77,122 @@ struct IpTrafficRecord {
 }
 
 // ==================== Prometheus Exporter 相关 ====================
+// 全局 GeoIP 数据库读取器
+static GEOIP_READER: Lazy<Mutex<Option<Reader<Vec<u8>>>>> = Lazy::new(|| Mutex::new(None));
+
+// IP 地理信息结构
+#[derive(Debug, Clone)]
+struct IpGeoInfo {
+    country: String,
+    province: String,
+    city: String,
+    isp: String,
+}
+
+fn init_geoip_db(db_path: &str) -> Result<(), String> {
+    match Reader::open_readfile(db_path) {
+        Ok(reader) => {
+            *GEOIP_READER.lock().unwrap() = Some(reader);
+            println!("GeoIP 数据库加载成功: {}", db_path);
+            Ok(())
+        }
+        Err(e) => Err(format!("GeoIP 数据库加载失败: {}", e)),
+    }
+}
+
+fn get_ip_geo_info(ip_str: &str) -> IpGeoInfo {
+    let default_info = IpGeoInfo {
+        country: "Unknown".to_string(),
+        province: "Unknown".to_string(),
+        city: "Unknown".to_string(),
+        isp: "Unknown".to_string(),
+    };
+
+    // 如果没有加载 GeoIP 数据库，返回默认值
+    let reader_guard = GEOIP_READER.lock().unwrap();
+    let reader = match reader_guard.as_ref() {
+        Some(r) => r,
+        None => return default_info,
+    };
+
+    // 解析 IP 地址
+    let ip: std::net::IpAddr = match ip_str.parse() {
+        Ok(ip) => ip,
+        Err(_) => return default_info,
+    };
+
+    // 查询 GeoIP 数据库
+    match reader.lookup::<geoip2::City>(ip) {
+        Ok(city) => {
+            let country = if let Some(c) = &city.country {
+                if let Some(names) = &c.names {
+                    names.get("zh-CN")
+                        .or_else(|| names.get("en"))
+                        .unwrap_or(&"Unknown")
+                        .to_string()
+                } else {
+                    "Unknown".to_string()
+                }
+            } else {
+                "Unknown".to_string()
+            };
+
+            let province = if let Some(subdivisions) = &city.subdivisions {
+                if let Some(first) = subdivisions.first() {
+                    if let Some(names) = &first.names {
+                        names.get("zh-CN")
+                            .or_else(|| names.get("en"))
+                            .unwrap_or(&"Unknown")
+                            .to_string()
+                    } else {
+                        "Unknown".to_string()
+                    }
+                } else {
+                    "Unknown".to_string()
+                }
+            } else {
+                "Unknown".to_string()
+            };
+
+            let city_name = if let Some(c) = &city.city {
+                if let Some(names) = &c.names {
+                    names.get("zh-CN")
+                        .or_else(|| names.get("en"))
+                        .unwrap_or(&"Unknown")
+                        .to_string()
+                } else {
+                    "Unknown".to_string()
+                }
+            } else {
+                "Unknown".to_string()
+            };
+
+            // GeoLite2-City 数据库不包含 ISP 详细信息
+            // 如需 ISP 信息，建议使用纯真 IP 数据库或付费的 GeoIP2-ISP 数据库
+            let isp = "Unknown".to_string();
+
+            IpGeoInfo {
+                country,
+                province,
+                city: city_name,
+                isp,
+            }
+        }
+        Err(_) => default_info,
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     db_path: String,
+    prometheus_export_threshold: i64,
 }
 
 async fn metrics_handler(data: web::Data<AppState>) -> HttpResponse {
     let db_path = &data.db_path;
+    let prometheus_export_threshold = data.prometheus_export_threshold;
     
-    match get_ip_traffic_metrics(db_path) {
+    match get_ip_traffic_metrics(db_path, prometheus_export_threshold) {
         Ok(metrics) => HttpResponse::Ok()
             .content_type("text/plain; version=0.0.4")
             .body(metrics),
@@ -83,7 +201,7 @@ async fn metrics_handler(data: web::Data<AppState>) -> HttpResponse {
     }
 }
 
-fn get_ip_traffic_metrics(db_path: &str) -> Result<String, String> {
+fn get_ip_traffic_metrics(db_path: &str, prometheus_export_threshold: i64) -> Result<String, String> {
     let mut conn = SqliteConnection::establish(db_path)
         .map_err(|e| format!("数据库连接失败: {}", e))?;
     
@@ -104,15 +222,37 @@ fn get_ip_traffic_metrics(db_path: &str) -> Result<String, String> {
     
     for (ip, total_bytes) in results {
         if let Some(bytes) = total_bytes {
-            output.push_str(&format!("ip_traffic_tx_bytes_total{{remote_ip=\"{}\"}} {}\n", ip, bytes));
+            if bytes <= prometheus_export_threshold {
+                continue;
+            }
+            // 获取 IP 地理信息
+            let geo_info = get_ip_geo_info(&ip);
+            
+            // 生成带地理信息标签的 metrics
+            output.push_str(&format!(
+                "ip_traffic_tx_bytes_total{{remote_ip=\"{}\",country=\"{}\",province=\"{}\",city=\"{}\",isp=\"{}\"}} {}\n",
+                ip, 
+                escape_label(&geo_info.country),
+                escape_label(&geo_info.province),
+                escape_label(&geo_info.city),
+                escape_label(&geo_info.isp),
+                bytes
+            ));
         }
     }
     
     Ok(output)
 }
 
-async fn start_prometheus_server(port: u16, db_path: String) -> std::io::Result<()> {
-    let app_state = AppState { db_path };
+// 转义 Prometheus 标签值中的特殊字符
+fn escape_label(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+async fn start_prometheus_server(port: u16, db_path: String, prometheus_export_threshold: i64) -> std::io::Result<()> {
+    let app_state = AppState { db_path, prometheus_export_threshold };
     
     println!("启动 Prometheus Exporter 服务，监听端口: {}", port);
     println!("访问 http://localhost:{}/metrics 获取指标数据", port);
@@ -411,13 +551,28 @@ async fn main() -> Result<(), String> {
     // 初始化数据库
     std::env::set_var("DATABASE_URL", &cli.db_path);
     
+    // 初始化 GeoIP 数据库（如果提供）
+    if let Some(ref geoip_path) = cli.geoip_db {
+        match init_geoip_db(geoip_path) {
+            Ok(_) => {},
+            Err(e) => {
+                eprintln!("警告: {}", e);
+                eprintln!("提示: 可以从 https://dev.maxmind.com/geoip/geolite2-free-geolocation-data 下载免费的 GeoLite2-City.mmdb");
+            }
+        }
+    } else {
+        println!("未指定 GeoIP 数据库，将不包含地理位置信息");
+        println!("提示: 使用 -g 参数指定 GeoIP2 数据库文件");
+    }
+    
     // 如果启用了 Prometheus exporter，在独立线程启动 HTTP 服务器
     if let Some(port) = cli.prometheus_port {
         let db_path_clone = cli.db_path.clone();
+        let prometheus_export_threshold = cli.prometheus_export_threshold;
         thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
-                if let Err(e) = start_prometheus_server(port, db_path_clone).await {
+                if let Err(e) = start_prometheus_server(port, db_path_clone, prometheus_export_threshold).await {
                     eprintln!("Prometheus exporter 启动失败: {}", e);
                 }
             });
