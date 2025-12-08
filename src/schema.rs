@@ -5,7 +5,7 @@ diesel::table! {
         id -> Integer,
         timestamp -> Text,
         remote_ip -> Text,
-        tx_rate -> Integer,
+        tx_bytes -> Integer,
         pid -> Nullable<Integer>,
     }
 }

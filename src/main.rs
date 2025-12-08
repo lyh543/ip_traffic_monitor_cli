@@ -46,7 +46,7 @@ struct Cli {
 struct NewIpTraffic {
     timestamp: String,
     remote_ip: String,
-    tx_rate: i32,
+    tx_bytes: i32,
     pid: Option<i32>,
 }
 
@@ -109,8 +109,8 @@ fn find_pid_by_inode(inode: u32) -> Option<u32> {
 struct IftopConnection {
     local_ip: String,
     remote_ip: String,
-    tx_rate: f64,  // 发送速率，单位 bytes/s
-    rx_rate: f64,  // 接收速率，单位 bytes/s
+    tx_bytes: f64,  // 发送字节数
+    rx_bytes: f64,  // 接收字节数
 }
 
 // ==================== 格式化速率显示函数 ====================
@@ -123,6 +123,19 @@ fn format_rate(bytes_per_sec: f64) -> String {
         format!("{:.2} KB/s", bytes_per_sec / 1024.0)
     } else {
         format!("{:.0} B/s", bytes_per_sec)
+    }
+}
+
+// ==================== 格式化字节数显示函数 ====================
+fn format_bytes(bytes: f64) -> String {
+    if bytes >= 1024.0 * 1024.0 * 1024.0 {
+        format!("{:.2} GB", bytes / (1024.0 * 1024.0 * 1024.0))
+    } else if bytes >= 1024.0 * 1024.0 {
+        format!("{:.2} MB", bytes / (1024.0 * 1024.0))
+    } else if bytes >= 1024.0 {
+        format!("{:.2} KB", bytes / 1024.0)
+    } else {
+        format!("{:.0} B", bytes)
     }
 }
 
@@ -157,7 +170,7 @@ fn parse_rate_to_bytes_per_sec(rate_str: &str) -> Option<f64> {
 }
 
 // ==================== iftop 输出解析函数 ====================
-fn parse_iftop_output(output: &str, local_ip: &str) -> Vec<IftopConnection> {
+fn parse_iftop_output(output: &str, local_ip: &str, sample_interval: u32) -> Vec<IftopConnection> {
     let mut connections = Vec::new();
     let lines: Vec<&str> = output.lines().collect();
     let mut i = 0;
@@ -202,8 +215,8 @@ fn parse_iftop_output(output: &str, local_ip: &str) -> Vec<IftopConnection> {
                                             connections.push(IftopConnection {
                                                 local_ip: local_ip.to_string(),
                                                 remote_ip: remote_ip.to_string(),
-                                                tx_rate,
-                                                rx_rate,
+                                                tx_bytes: tx_rate * sample_interval as f64,
+                                                rx_bytes: rx_rate * sample_interval as f64,
                                             });
                                         }
                                     }
@@ -274,7 +287,7 @@ fn run_iftop_and_parse(interface: &str, sample_interval: u32) -> Result<Vec<Ifto
     // 等待进程结束
     let _ = child.wait();
 
-    let connections = parse_iftop_output(&output, &local_ip);
+    let connections = parse_iftop_output(&output, &local_ip, sample_interval);
     
     Ok(connections)
 }
@@ -348,13 +361,13 @@ fn process_connections(connections: &[IftopConnection], conn: &mut SqliteConnect
         println!("[{}] 流量统计：", Local::now().format("%H:%M:%S"));
         
         for connection in connections {
-            if connection.tx_rate > 0.0 {
+            if connection.tx_bytes > 0.0 {
                 let pid = find_pid_for_connection(&connection.remote_ip);
                 
                 let traffic = NewIpTraffic {
                     timestamp: timestamp.clone(),
                     remote_ip: connection.remote_ip.clone(),
-                    tx_rate: connection.tx_rate as i32,
+                    tx_bytes: connection.tx_bytes as i32,
                     pid,
                 };
                 
@@ -365,10 +378,10 @@ fn process_connections(connections: &[IftopConnection], conn: &mut SqliteConnect
                     eprintln!("插入数据库失败: {}", e);
                 }
                 
-                println!("  IP: {} | 出口速率: {} | 入口速率: {} | PID: {}",
+                println!("  IP: {} | 出口字节: {} | 入口字节: {} | PID: {}",
                        connection.remote_ip,
-                       format_rate(connection.tx_rate),
-                       format_rate(connection.rx_rate),
+                       format_bytes(connection.tx_bytes),
+                       format_bytes(connection.rx_bytes),
                        pid.unwrap_or(0));
             }
         }
