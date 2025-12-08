@@ -9,6 +9,7 @@ use std::io::{BufRead, BufReader};
 use std::thread;
 use std::time::Duration;
 use std::str::FromStr;
+use actix_web::{web, App, HttpServer, HttpResponse};
 
 // 导入 Diesel 生成的 schema（需按前版步骤生成）
 mod schema;
@@ -38,6 +39,10 @@ struct Cli {
     /// iftop 采样间隔（默认 2 秒）
     #[arg(short = 's', long, default_value_t = 2, help = "iftop 采样间隔")]
     sample_interval: u32,
+
+    /// 启用 Prometheus exporter（默认端口：9090）
+    #[arg(short = 'p', long, help = "启用 Prometheus exporter 监听端口")]
+    prometheus_port: Option<u16>,
 }
 
 // ==================== ORM 模型 ====================
@@ -48,6 +53,78 @@ struct NewIpTraffic {
     remote_ip: String,
     tx_bytes: i32,
     pid: Option<i32>,
+}
+
+#[derive(Debug, Clone, Queryable)]
+#[diesel(table_name = ip_traffic)]
+struct IpTrafficRecord {
+    id: i32,
+    timestamp: String,
+    remote_ip: String,
+    tx_bytes: i32,
+    pid: Option<i32>,
+}
+
+// ==================== Prometheus Exporter 相关 ====================
+#[derive(Clone)]
+struct AppState {
+    db_path: String,
+}
+
+async fn metrics_handler(data: web::Data<AppState>) -> HttpResponse {
+    let db_path = &data.db_path;
+    
+    match get_ip_traffic_metrics(db_path) {
+        Ok(metrics) => HttpResponse::Ok()
+            .content_type("text/plain; version=0.0.4")
+            .body(metrics),
+        Err(e) => HttpResponse::InternalServerError()
+            .body(format!("Error generating metrics: {}", e)),
+    }
+}
+
+fn get_ip_traffic_metrics(db_path: &str) -> Result<String, String> {
+    let mut conn = SqliteConnection::establish(db_path)
+        .map_err(|e| format!("数据库连接失败: {}", e))?;
+    
+    use schema::ip_traffic::dsl::*;
+    use diesel::dsl::sum;
+    
+    // 查询每个 IP 的累计流量
+    let results: Vec<(String, Option<i64>)> = ip_traffic
+        .group_by(remote_ip)
+        .select((remote_ip, sum(tx_bytes)))
+        .load(&mut conn)
+        .map_err(|e| format!("查询数据库失败: {}", e))?;
+    
+    // 生成 Prometheus 格式的输出
+    let mut output = String::new();
+    output.push_str("# HELP ip_traffic_tx_bytes_total Total transmitted bytes per IP address\n");
+    output.push_str("# TYPE ip_traffic_tx_bytes_total counter\n");
+    
+    for (ip, total_bytes) in results {
+        if let Some(bytes) = total_bytes {
+            output.push_str(&format!("ip_traffic_tx_bytes_total{{remote_ip=\"{}\"}} {}\n", ip, bytes));
+        }
+    }
+    
+    Ok(output)
+}
+
+async fn start_prometheus_server(port: u16, db_path: String) -> std::io::Result<()> {
+    let app_state = AppState { db_path };
+    
+    println!("启动 Prometheus Exporter 服务，监听端口: {}", port);
+    println!("访问 http://localhost:{}/metrics 获取指标数据", port);
+    
+    HttpServer::new(move || {
+        App::new()
+            .app_data(web::Data::new(app_state.clone()))
+            .route("/metrics", web::get().to(metrics_handler))
+    })
+    .bind(("0.0.0.0", port))?
+    .run()
+    .await
 }
 
 // ==================== 工具函数（复用前版逻辑） ====================
@@ -107,7 +184,6 @@ fn find_pid_by_inode(inode: u32) -> Option<u32> {
 // ==================== iftop 输出解析结构 ====================
 #[derive(Debug, Clone)]
 struct IftopConnection {
-    local_ip: String,
     remote_ip: String,
     tx_bytes: f64,  // 发送字节数
     rx_bytes: f64,  // 接收字节数
@@ -213,7 +289,6 @@ fn parse_iftop_output(output: &str, local_ip: &str, sample_interval: u32) -> Vec
                                             };
                                             
                                             connections.push(IftopConnection {
-                                                local_ip: local_ip.to_string(),
                                                 remote_ip: remote_ip.to_string(),
                                                 tx_bytes: tx_rate * sample_interval as f64,
                                                 rx_bytes: rx_rate * sample_interval as f64,
@@ -310,7 +385,8 @@ fn run_monitor_cycle(iface: &str, sample_interval: u32, conn: &mut SqliteConnect
 }
 
 // ==================== 主函数 ====================
-fn main() -> Result<(), String> {
+#[tokio::main]
+async fn main() -> Result<(), String> {
     let cli = Cli::parse();
     
     let is_permanent = cli.duration == 0;
@@ -325,13 +401,35 @@ fn main() -> Result<(), String> {
                  cli.iface, cli.duration, cli.sample_interval);
     }
     println!("数据库: {}", cli.db_path);
+    
+    // 如果启用了 Prometheus exporter，显示信息
+    if let Some(port) = cli.prometheus_port {
+        println!("Prometheus Exporter: http://0.0.0.0:{}/metrics", port);
+    }
     println!("========================================");
 
     // 初始化数据库
     std::env::set_var("DATABASE_URL", &cli.db_path);
+    
+    // 如果启用了 Prometheus exporter，在独立线程启动 HTTP 服务器
+    if let Some(port) = cli.prometheus_port {
+        let db_path_clone = cli.db_path.clone();
+        thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                if let Err(e) = start_prometheus_server(port, db_path_clone).await {
+                    eprintln!("Prometheus exporter 启动失败: {}", e);
+                }
+            });
+        });
+        // 给服务器一点时间启动
+        thread::sleep(Duration::from_millis(500));
+    }
+    
+    // 直接在主线程运行监控逻辑
     let mut conn = SqliteConnection::establish(&cli.db_path)
         .map_err(|e| format!("数据库连接失败: {}", e))?;
-
+    
     if is_permanent {
         // 永久运行模式
         let mut cycle = 1;
