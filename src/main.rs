@@ -9,7 +9,7 @@ use std::io::{BufRead, BufReader};
 use std::thread;
 use std::time::Duration;
 use std::str::FromStr;
-use actix_web::{web, App, HttpServer, HttpResponse};
+use actix_web::{web, App, HttpServer, HttpResponse, middleware::Compress};
 use maxminddb::{geoip2, Reader};
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
@@ -263,6 +263,7 @@ async fn start_prometheus_server(port: u16, db_path: String, prometheus_export_t
     
     HttpServer::new(move || {
         App::new()
+            .wrap(Compress::default())
             .app_data(web::Data::new(app_state.clone()))
             .route("/metrics", web::get().to(metrics_handler))
     })
