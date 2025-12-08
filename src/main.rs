@@ -1,6 +1,5 @@
 use chrono::Local;
 use clap::Parser;
-use diesel::prelude::*;
 use hex::decode;
 use procfs::process::Process;
 use std::net::Ipv4Addr;
@@ -9,15 +8,13 @@ use std::io::{BufRead, BufReader};
 use std::thread;
 use std::time::Duration;
 use std::str::FromStr;
+use std::collections::HashMap;
+use std::sync::Arc;
 use actix_web::{web, App, HttpServer, HttpResponse, middleware::Compress};
 use maxminddb::{geoip2, Reader};
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-
-// 导入 Diesel 生成的 schema（需按前版步骤生成）
-mod schema;
-use schema::ip_traffic;
 
 // ==================== 命令行参数定义 ====================
 #[derive(Parser, Debug)]
@@ -30,15 +27,6 @@ struct Cli {
     /// 监控时长（单位：秒，默认 30 秒，设置为 0 表示永久运行）
     #[arg(short, long, default_value_t = 30, help = "示例：60（监控 1 分钟），0（永久运行）")]
     duration: u32,
-
-    /// 数据库文件路径（默认：ip_traffic_stats_orm.db）
-    #[arg(
-        short = 'f',
-        long,
-        default_value = "ip_traffic_stats_orm.db",
-        help = "示例：./data/traffic.db"
-    )]
-    db_path: String,
 
     /// iftop 采样间隔（默认 2 秒）
     #[arg(short = 's', long, default_value_t = 2, help = "iftop 采样间隔")]
@@ -54,27 +42,7 @@ struct Cli {
 
     /// Prometheus metrics 流量阈值（单位：字节，默认 1MB）
     #[arg(short = 't', long, default_value_t = 1024 * 1024, help = "低于此阈值的流量不会导出到 Prometheus")]
-    prometheus_export_threshold: i64,
-}
-
-// ==================== ORM 模型 ====================
-#[derive(Debug, Clone, Insertable)]
-#[diesel(table_name = ip_traffic)]
-struct NewIpTraffic {
-    timestamp: String,
-    remote_ip: String,
-    tx_bytes: i32,
-    pid: Option<i32>,
-}
-
-#[derive(Debug, Clone, Queryable)]
-#[diesel(table_name = ip_traffic)]
-struct IpTrafficRecord {
-    id: i32,
-    timestamp: String,
-    remote_ip: String,
-    tx_bytes: i32,
-    pid: Option<i32>,
+    prometheus_export_threshold: u64,
 }
 
 // ==================== Prometheus Exporter 相关 ====================
@@ -83,6 +51,10 @@ static GEOIP_READER: Lazy<Mutex<Option<Reader<Vec<u8>>>>> = Lazy::new(|| Mutex::
 
 // 全局退出标志
 static RUNNING: AtomicBool = AtomicBool::new(true);
+
+// 全局 IP 流量统计存储（IP -> 累计字节数）
+type IpTrafficStore = Arc<Mutex<HashMap<String, u64>>>;
+static IP_TRAFFIC_STATS: Lazy<IpTrafficStore> = Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
 
 // IP 地理信息结构
 #[derive(Debug, Clone)]
@@ -188,15 +160,13 @@ fn get_ip_geo_info(ip_str: &str) -> IpGeoInfo {
 
 #[derive(Clone)]
 struct AppState {
-    db_path: String,
-    prometheus_export_threshold: i64,
+    prometheus_export_threshold: u64,
 }
 
 async fn metrics_handler(data: web::Data<AppState>) -> HttpResponse {
-    let db_path = &data.db_path;
     let prometheus_export_threshold = data.prometheus_export_threshold;
     
-    match get_ip_traffic_metrics(db_path, prometheus_export_threshold) {
+    match get_ip_traffic_metrics(prometheus_export_threshold) {
         Ok(metrics) => HttpResponse::Ok()
             .content_type("text/plain; version=0.0.4")
             .body(metrics),
@@ -205,44 +175,32 @@ async fn metrics_handler(data: web::Data<AppState>) -> HttpResponse {
     }
 }
 
-fn get_ip_traffic_metrics(db_path: &str, prometheus_export_threshold: i64) -> Result<String, String> {
-    let mut conn = SqliteConnection::establish(db_path)
-        .map_err(|e| format!("数据库连接失败: {}", e))?;
-    
-    use schema::ip_traffic::dsl::*;
-    use diesel::dsl::sum;
-    
-    // 查询每个 IP 的累计流量
-    let results: Vec<(String, Option<i64>)> = ip_traffic
-        .group_by(remote_ip)
-        .select((remote_ip, sum(tx_bytes)))
-        .load(&mut conn)
-        .map_err(|e| format!("查询数据库失败: {}", e))?;
+fn get_ip_traffic_metrics(prometheus_export_threshold: u64) -> Result<String, String> {
+    // 从内存中获取流量统计
+    let stats = IP_TRAFFIC_STATS.lock().unwrap();
     
     // 生成 Prometheus 格式的输出
     let mut output = String::new();
     output.push_str("# HELP ip_traffic_tx_bytes_total Total transmitted bytes per IP address\n");
     output.push_str("# TYPE ip_traffic_tx_bytes_total counter\n");
     
-    for (ip, total_bytes) in results {
-        if let Some(bytes) = total_bytes {
-            if bytes <= prometheus_export_threshold {
-                continue;
-            }
-            // 获取 IP 地理信息
-            let geo_info = get_ip_geo_info(&ip);
-            
-            // 生成带地理信息标签的 metrics
-            output.push_str(&format!(
-                "ip_traffic_tx_bytes_total{{remote_ip=\"{}\",country=\"{}\",province=\"{}\",city=\"{}\",isp=\"{}\"}} {}\n",
-                ip, 
-                escape_label(&geo_info.country),
-                escape_label(&geo_info.province),
-                escape_label(&geo_info.city),
-                escape_label(&geo_info.isp),
-                bytes
-            ));
+    for (ip, &bytes) in stats.iter() {
+        if bytes <= prometheus_export_threshold {
+            continue;
         }
+        // 获取 IP 地理信息
+        let geo_info = get_ip_geo_info(ip);
+        
+        // 生成带地理信息标签的 metrics
+        output.push_str(&format!(
+            "ip_traffic_tx_bytes_total{{remote_ip=\"{}\",country=\"{}\",province=\"{}\",city=\"{}\",isp=\"{}\"}} {}\n",
+            ip, 
+            escape_label(&geo_info.country),
+            escape_label(&geo_info.province),
+            escape_label(&geo_info.city),
+            escape_label(&geo_info.isp),
+            bytes
+        ));
     }
     
     Ok(output)
@@ -255,8 +213,8 @@ fn escape_label(s: &str) -> String {
         .replace('\n', "\\n")
 }
 
-async fn start_prometheus_server(port: u16, db_path: String, prometheus_export_threshold: i64) -> std::io::Result<()> {
-    let app_state = AppState { db_path, prometheus_export_threshold };
+async fn start_prometheus_server(port: u16, prometheus_export_threshold: u64) -> std::io::Result<()> {
+    let app_state = AppState { prometheus_export_threshold };
     
     println!("启动 Prometheus Exporter 服务，监听端口: {}", port);
     println!("访问 http://localhost:{}/metrics 获取指标数据", port);
@@ -332,19 +290,6 @@ struct IftopConnection {
     remote_ip: String,
     tx_bytes: f64,  // 发送字节数
     rx_bytes: f64,  // 接收字节数
-}
-
-// ==================== 格式化速率显示函数 ====================
-fn format_rate(bytes_per_sec: f64) -> String {
-    if bytes_per_sec >= 1024.0 * 1024.0 * 1024.0 {
-        format!("{:.2} GB/s", bytes_per_sec / (1024.0 * 1024.0 * 1024.0))
-    } else if bytes_per_sec >= 1024.0 * 1024.0 {
-        format!("{:.2} MB/s", bytes_per_sec / (1024.0 * 1024.0))
-    } else if bytes_per_sec >= 1024.0 {
-        format!("{:.2} KB/s", bytes_per_sec / 1024.0)
-    } else {
-        format!("{:.0} B/s", bytes_per_sec)
-    }
 }
 
 // ==================== 格式化字节数显示函数 ====================
@@ -513,12 +458,12 @@ fn run_iftop_and_parse(interface: &str, sample_interval: u32) -> Result<Vec<Ifto
 }
 
 // ==================== 执行单次监控周期 ====================
-fn run_monitor_cycle(iface: &str, sample_interval: u32, conn: &mut SqliteConnection, cycle_info: &str) -> Result<(), String> {
+fn run_monitor_cycle(iface: &str, sample_interval: u32, cycle_info: &str) -> Result<(), String> {
     println!("[{}] 正在采集流量数据...", cycle_info);
     
     match run_iftop_and_parse(iface, sample_interval) {
         Ok(connections) => {
-            process_connections(&connections, conn)?;
+            process_connections(&connections)?;
         }
         Err(e) => {
             eprintln!("iftop 执行失败: {}", e);
@@ -536,7 +481,7 @@ async fn main() -> Result<(), String> {
     
     let is_permanent = cli.duration == 0;
     
-    println!("基于 iftop 的精确IP流量监控工具");
+    println!("基于 iftop 的精确IP流量监控工具（内存模式）");
     if is_permanent {
         println!("网卡: {}, 监控模式: 永久运行, 采样间隔: {}秒", 
                  cli.iface, cli.sample_interval);
@@ -545,7 +490,6 @@ async fn main() -> Result<(), String> {
         println!("网卡: {}, 监控时长: {}秒, 采样间隔: {}秒", 
                  cli.iface, cli.duration, cli.sample_interval);
     }
-    println!("数据库: {}", cli.db_path);
     
     // 如果启用了 Prometheus exporter，显示信息
     if let Some(port) = cli.prometheus_port {
@@ -558,9 +502,6 @@ async fn main() -> Result<(), String> {
         println!("\n收到退出信号，正在优雅关闭...");
         RUNNING.store(false, Ordering::SeqCst);
     }).map_err(|e| format!("设置 Ctrl+C 处理器失败: {}", e))?;
-
-    // 初始化数据库
-    std::env::set_var("DATABASE_URL", &cli.db_path);
     
     // 初始化 GeoIP 数据库（如果提供）
     if let Some(ref geoip_path) = cli.geoip_db {
@@ -578,12 +519,11 @@ async fn main() -> Result<(), String> {
     
     // 如果启用了 Prometheus exporter，在独立线程启动 HTTP 服务器
     if let Some(port) = cli.prometheus_port {
-        let db_path_clone = cli.db_path.clone();
         let prometheus_export_threshold = cli.prometheus_export_threshold;
         thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
-                if let Err(e) = start_prometheus_server(port, db_path_clone, prometheus_export_threshold).await {
+                if let Err(e) = start_prometheus_server(port, prometheus_export_threshold).await {
                     eprintln!("Prometheus exporter 启动失败: {}", e);
                 }
             });
@@ -593,17 +533,14 @@ async fn main() -> Result<(), String> {
     }
     
     // 直接在主线程运行监控逻辑
-    let mut conn = SqliteConnection::establish(&cli.db_path)
-        .map_err(|e| format!("数据库连接失败: {}", e))?;
-    
     if is_permanent {
         // 永久运行模式
         let mut cycle = 1;
         while RUNNING.load(Ordering::SeqCst) {
-            run_monitor_cycle(&cli.iface, cli.sample_interval, &mut conn, &format!("周期 {}", cycle))?;
+            run_monitor_cycle(&cli.iface, cli.sample_interval, &format!("周期 {}", cycle))?;
             cycle += 1;
         }
-        println!("监控已停止，数据已保存到 {}", cli.db_path);
+        println!("监控已停止");
     } else {
         // 定时运行模式
         let cycles = cli.duration / cli.sample_interval;
@@ -613,44 +550,36 @@ async fn main() -> Result<(), String> {
                 println!("\n监控提前终止");
                 break;
             }
-            run_monitor_cycle(&cli.iface, cli.sample_interval, &mut conn, &format!("{}/{}", cycle, cycles))?;
+            run_monitor_cycle(&cli.iface, cli.sample_interval, &format!("{}/{}", cycle, cycles))?;
         }
         
-        println!("监控完成，数据已保存到 {}", cli.db_path);
+        println!("监控完成");
     }
     
     Ok(())
 }
 
 // ==================== 处理连接数据的辅助函数 ====================
-fn process_connections(connections: &[IftopConnection], conn: &mut SqliteConnection) -> Result<(), String> {
-    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    
+fn process_connections(connections: &[IftopConnection]) -> Result<(), String> {
     if !connections.is_empty() {
         println!("[{}] 流量统计：", Local::now().format("%H:%M:%S"));
+        
+        // 获取全局统计存储的锁
+        let mut stats = IP_TRAFFIC_STATS.lock().unwrap();
         
         for connection in connections {
             if connection.tx_bytes > 0.0 {
                 let pid = find_pid_for_connection(&connection.remote_ip);
                 
-                let traffic = NewIpTraffic {
-                    timestamp: timestamp.clone(),
-                    remote_ip: connection.remote_ip.clone(),
-                    tx_bytes: connection.tx_bytes as i32,
-                    pid,
-                };
+                // 累加到内存中的统计
+                let counter = stats.entry(connection.remote_ip.clone()).or_insert(0);
+                *counter += connection.tx_bytes as u64;
                 
-                // 插入数据库
-                if let Err(e) = diesel::insert_into(ip_traffic::table)
-                    .values(&traffic)
-                    .execute(conn) {
-                    eprintln!("插入数据库失败: {}", e);
-                }
-                
-                println!("  IP: {} | 出口字节: {} | 入口字节: {} | PID: {}",
+                println!("  IP: {} | 出口字节: {} | 入口字节: {} | 累计: {} | PID: {}",
                        connection.remote_ip,
                        format_bytes(connection.tx_bytes),
                        format_bytes(connection.rx_bytes),
+                       format_bytes(*counter as f64),
                        pid.unwrap_or(0));
             }
         }

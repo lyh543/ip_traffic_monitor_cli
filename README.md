@@ -5,7 +5,7 @@
 ## 功能特性
 
 - ✅ 基于 iftop 的精确流量监控
-- ✅ SQLite 数据库存储历史数据
+- ✅ 内存存储 IP 流量累计数据
 - ✅ Prometheus Exporter 接口
 - ✅ IP 地理位置信息（国家、省份、城市）
 - ✅ ISP 运营商信息支持
@@ -132,12 +132,12 @@ rate(ip_traffic_tx_bytes_total[5m])
 ## 命令行参数
 
 ```
--i, --iface <IFACE>              出口网卡名（必填）
--d, --duration <DURATION>        监控时长（秒，0=永久运行）[默认: 30]
--f, --db-path <DB_PATH>          数据库文件路径 [默认: ip_traffic_stats_orm.db]
--s, --sample-interval <SECONDS>  iftop 采样间隔 [默认: 2]
--p, --prometheus-port <PORT>     启用 Prometheus exporter 监听端口
--g, --geoip-db <PATH>            GeoIP2 数据库文件路径（可选）
+-i, --iface <IFACE>                    出口网卡名（必填）
+-d, --duration <DURATION>              监控时长（秒，0=永久运行）[默认: 30]
+-s, --sample-interval <SECONDS>        iftop 采样间隔 [默认: 2]
+-p, --prometheus-port <PORT>           启用 Prometheus exporter 监听端口
+-g, --geoip-db <PATH>                  GeoIP2 数据库文件路径（可选）
+-t, --prometheus-export-threshold <N>  Prometheus 导出流量阈值（字节）[默认: 1048576]
 ```
 
 ## 使用场景
@@ -145,7 +145,7 @@ rate(ip_traffic_tx_bytes_total[5m])
 ### 1. 实时流量监控
 
 ```bash
-# 持续监控并保存到数据库
+# 持续监控（内存模式）
 sudo ./target/release/ip_traffic_monitor_cli -i eth0 -d 0
 ```
 
@@ -159,8 +159,11 @@ sudo ./target/release/ip_traffic_monitor_cli -i eth0 -d 300
 ### 3. Prometheus 集成
 
 ```bash
-# 启动 exporter 供 Prometheus 抓取
+# 启动 exporter 供 Prometheus 抓取（推荐）
 sudo ./target/release/ip_traffic_monitor_cli -i eth0 -d 0 -p 9090 -g GeoLite2-City.mmdb
+
+# 设置流量阈值，只导出大于 10MB 的 IP
+sudo ./target/release/ip_traffic_monitor_cli -i eth0 -d 0 -p 9090 -t 10485760
 ```
 
 ### 4. Grafana 可视化
@@ -185,8 +188,15 @@ sudo ./target/release/ip_traffic_monitor_cli -i eth0 -d 0 -p 9090 -g GeoLite2-Ci
 ## 依赖
 
 - iftop: 流量监控工具
-- SQLite: 数据存储
 - GeoIP2 数据库（可选）: IP 地理位置查询
+
+## 架构说明
+
+本工具采用内存存储架构：
+- 所有 IP 流量数据存储在内存中的 HashMap
+- 累计每个 IP 的总字节数
+- 通过 Prometheus exporter 直接导出实时数据
+- 适合与 Prometheus + Grafana 配合使用进行长期存储和可视化
 
 ## 许可证
 

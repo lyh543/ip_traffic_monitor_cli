@@ -4,12 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-diesel = { version = "2.1", features = ["sqlite", "chrono"] }
 chrono = { version = "0.4.38", features = ["serde"] }
-byteorder = "1.5.0"
 hex = "0.4.3"
 procfs = "0.16.0"
-diesel_migrations = "2.1"
 clap = { version = "4.4", features = ["derive"] }  # 命令行参数解析
 actix-web = { version = "4.4", features = ["compress-gzip", "compress-zstd"] }  # Web 框架用于 Prometheus exporter
 tokio = { version = "1.35", features = ["rt-multi-thread", "macros"] }  # 异步运行时
