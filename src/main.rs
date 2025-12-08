@@ -13,6 +13,7 @@ use actix_web::{web, App, HttpServer, HttpResponse};
 use maxminddb::{geoip2, Reader};
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // 导入 Diesel 生成的 schema（需按前版步骤生成）
 mod schema;
@@ -79,6 +80,9 @@ struct IpTrafficRecord {
 // ==================== Prometheus Exporter 相关 ====================
 // 全局 GeoIP 数据库读取器
 static GEOIP_READER: Lazy<Mutex<Option<Reader<Vec<u8>>>>> = Lazy::new(|| Mutex::new(None));
+
+// 全局退出标志
+static RUNNING: AtomicBool = AtomicBool::new(true);
 
 // IP 地理信息结构
 #[derive(Debug, Clone)]
@@ -548,6 +552,12 @@ async fn main() -> Result<(), String> {
     }
     println!("========================================");
 
+    // 设置 Ctrl+C 信号处理
+    ctrlc::set_handler(|| {
+        println!("\n收到退出信号，正在优雅关闭...");
+        RUNNING.store(false, Ordering::SeqCst);
+    }).map_err(|e| format!("设置 Ctrl+C 处理器失败: {}", e))?;
+
     // 初始化数据库
     std::env::set_var("DATABASE_URL", &cli.db_path);
     
@@ -588,15 +598,20 @@ async fn main() -> Result<(), String> {
     if is_permanent {
         // 永久运行模式
         let mut cycle = 1;
-        loop {
+        while RUNNING.load(Ordering::SeqCst) {
             run_monitor_cycle(&cli.iface, cli.sample_interval, &mut conn, &format!("周期 {}", cycle))?;
             cycle += 1;
         }
+        println!("监控已停止，数据已保存到 {}", cli.db_path);
     } else {
         // 定时运行模式
         let cycles = cli.duration / cli.sample_interval;
         
         for cycle in 1..=cycles {
+            if !RUNNING.load(Ordering::SeqCst) {
+                println!("\n监控提前终止");
+                break;
+            }
             run_monitor_cycle(&cli.iface, cli.sample_interval, &mut conn, &format!("{}/{}", cycle, cycles))?;
         }
         
