@@ -12,7 +12,6 @@ NC='\033[0m' # No Color
 REMOTE_HOST="lyh543@frps.lyh543.cn"
 REMOTE_PORT="22222"
 REMOTE_DIR="/home/lyh543/workspace/ip_traffic_monitor_cli"
-DB_FILE="ip_traffic_stats_orm.db"
 GEOIP_DB="GeoLite2-City.mmdb"
 GEOIP_URL="https://git.io/GeoLite2-City.mmdb"
 
@@ -53,11 +52,6 @@ if [[ ! -f "./target/release/ip_traffic_monitor_cli" ]]; then
     exit 1
 fi
 
-if [[ ! -d "./migrations" ]]; then
-    echo -e "${RED}错误: migrations 目录不存在${NC}"
-    exit 1
-fi
-
 # 3. 创建远端目录
 echo -e "${YELLOW}步骤 2: 创建远端目录...${NC}"
 ssh -p ${REMOTE_PORT} ${REMOTE_HOST} "mkdir -p ${REMOTE_DIR}"
@@ -66,83 +60,13 @@ ssh -p ${REMOTE_PORT} ${REMOTE_HOST} "mkdir -p ${REMOTE_DIR}"
 echo -e "${YELLOW}步骤 3: 上传可执行文件...${NC}"
 rsync -avz -e "ssh -p ${REMOTE_PORT}" ./target/release/ip_traffic_monitor_cli ${REMOTE_HOST}:${REMOTE_DIR}/ip_traffic_monitor_cli
 
-# 5. 上传 migrations 目录
-echo -e "${YELLOW}步骤 4: 上传 migrations...${NC}"
-rsync -avz -e "ssh -p ${REMOTE_PORT}" --delete ./migrations/ ${REMOTE_HOST}:${REMOTE_DIR}/migrations/
-
-# 5.5. 上传 GeoIP 数据库
-echo -e "${YELLOW}步骤 4.5: 上传 GeoIP 数据库...${NC}"
+# 5. 上传 GeoIP 数据库
+echo -e "${YELLOW}步骤 4: 上传 GeoIP 数据库...${NC}"
 rsync -avz -e "ssh -p ${REMOTE_PORT}" "./${GEOIP_DB}" "${REMOTE_HOST}:${REMOTE_DIR}/${GEOIP_DB}"
 echo -e "${GREEN}✓ GeoIP 数据库已上传${NC}"
 
-# 6. 上传 diesel.toml 配置文件（如果存在）
-if [[ -f "./diesel.toml" ]]; then
-    echo -e "${YELLOW}步骤 5: 上传 diesel 配置...${NC}"
-    rsync -avz -e "ssh -p ${REMOTE_PORT}" ./diesel.toml ${REMOTE_HOST}:${REMOTE_DIR}/
-fi
-
-# 6. 检查本地是否有 diesel CLI，如果有则上传
-echo -e "${YELLOW}步骤 6: 处理 diesel CLI...${NC}"
-if command -v diesel &> /dev/null; then
-    echo "检测到本地 diesel CLI，上传到远端..."
-    # 找到 diesel 二进制文件路径
-    DIESEL_PATH=$(which diesel)
-    rsync -avz -e "ssh -p ${REMOTE_PORT}" ${DIESEL_PATH} ${REMOTE_HOST}:${REMOTE_DIR}/diesel_cli
-    USE_DIESEL_CLI=true
-else
-    echo "本地没有 diesel CLI，将直接执行 SQL migrations"
-    USE_DIESEL_CLI=false
-fi
-
-# 7. 运行 migrations
-echo -e "${YELLOW}步骤 7: 运行数据库 migrations...${NC}"
-if [[ "$USE_DIESEL_CLI" == "true" ]]; then
-    ssh -p ${REMOTE_PORT} ${REMOTE_HOST} "
-        cd ${REMOTE_DIR}
-        export DATABASE_URL=${DB_FILE}
-        echo '使用 diesel CLI 运行 migrations...'
-        chmod +x ./diesel_cli
-        ./diesel_cli migration run
-        echo 'Migrations 完成'
-    "
-else
-    # 直接执行 SQL 文件
-    ssh -p ${REMOTE_PORT} ${REMOTE_HOST} "
-        cd ${REMOTE_DIR}
-        echo '直接执行 SQL migrations...'
-        
-        # 检查是否安装了 sqlite3
-        if ! command -v sqlite3 &> /dev/null; then
-            echo '错误: 远端没有安装 sqlite3，无法执行 migrations'
-            echo '请在远端安装 sqlite3: sudo apt-get install sqlite3'
-            exit 1
-        fi
-        
-        # 创建数据库文件（如果不存在）
-        if [[ ! -f ${DB_FILE} ]]; then
-            echo '创建数据库文件...'
-            touch ${DB_FILE}
-        fi
-        
-        # 检查是否已经应用过 migrations（简单检查表是否存在）
-        if sqlite3 ${DB_FILE} \".tables\" | grep -q \"ip_traffic\"; then
-            echo '数据库表已存在，跳过 migration'
-        else
-            echo '应用 migrations...'
-            # 执行所有 up.sql 文件
-            for migration_dir in migrations/*/; do
-                if [[ -f \"\${migration_dir}up.sql\" ]]; then
-                    echo \"执行 migration: \${migration_dir}\"
-                    sqlite3 ${DB_FILE} < \"\${migration_dir}up.sql\"
-                fi
-            done
-            echo 'Migrations 完成'
-        fi
-    "
-fi
-
-# 8. 停止旧进程并启动新进程
-echo -e "${YELLOW}步骤 8: 重启服务...${NC}"
+# 6. 停止旧进程并启动新进程
+echo -e "${YELLOW}步骤 5: 重启服务...${NC}"
 ssh -p ${REMOTE_PORT} ${REMOTE_HOST} "
     echo '停止旧进程...'
     sudo killall ip_traffic_monitor_cli || true
@@ -156,12 +80,12 @@ ssh -p ${REMOTE_PORT} ${REMOTE_HOST} "
         --geoip-db ${GEOIP_DB} \
         > ip_traffic_monitor.log 2>&1 &
     echo '进程已在后台启动，日志输出到 ip_traffic_monitor.log'
-    echo 'Prometheus exporter 监听端口: 9090'
+    echo 'Prometheus exporter 监听端口: 9091'
     sleep 2
     echo '检查进程状态:'
     if pgrep -f ip_traffic_monitor_cli > /dev/null; then
         echo '✓ 进程启动成功'
-        echo '访问 http://服务器IP:9090/metrics 查看 Prometheus 指标'
+        echo '访问 http://服务器IP:9091/metrics 查看 Prometheus 指标'
     else
         echo '✗ 进程启动失败，请检查日志'
         tail -10 ip_traffic_monitor.log
@@ -170,6 +94,7 @@ ssh -p ${REMOTE_PORT} ${REMOTE_HOST} "
 
 echo -e "${GREEN}部署完成！${NC}"
 echo -e "${GREEN}提示:${NC}"
-echo -e "  - Prometheus metrics: http://${REMOTE_HOST}:9090/metrics"
+echo -e "  - Prometheus metrics: http://${REMOTE_HOST}:9091/metrics"
 echo -e "  - 查看日志: ssh -p ${REMOTE_PORT} ${REMOTE_HOST} 'tail -f ${REMOTE_DIR}/ip_traffic_monitor.log'"
 echo -e "  - GeoIP 数据库: ${GREEN}已启用${NC} (包含国家/省份/城市信息)"
+echo -e "  - 存储模式: ${GREEN}内存存储${NC} (无需数据库)"
