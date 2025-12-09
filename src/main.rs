@@ -17,6 +17,17 @@ use once_cell::sync::Lazy;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+// ==================== 权限检查 ====================
+fn check_root_permission() -> Result<(), String> {
+    let is_root = unsafe { libc::geteuid() } == 0;
+    
+    if !is_root {
+        return Err("此程序需要 root 权限运行，请使用 sudo 执行".to_string());
+    }
+    
+    Ok(())
+}
+
 // ==================== 命令行参数定义 ====================
 #[derive(Parser, Debug)]
 #[command(author, version, about = "IP 流量统计工具（支持 iftop 和 bpftrace）", long_about = None)]
@@ -307,6 +318,9 @@ async fn main() -> Result<(), String> {
         println!("Prometheus Exporter: http://0.0.0.0:{}/metrics", port);
     }
     println!("========================================");
+
+    // 检查 root 权限
+    check_root_permission()?;
 
     // 初始化监控器
     monitor.init().map_err(|e| e.to_string())?;

@@ -150,9 +150,8 @@ impl TrafficMonitor for IftopMonitor {
     }
 
     fn start(&mut self) -> Result<HashMap<String, TrafficStats>, Box<dyn Error>> {
-        let mut child = Command::new("sudo")
+        let mut child = Command::new("iftop")
             .args(&[
-                "iftop",
                 "-i",
                 &self.interface,
                 "-t",
