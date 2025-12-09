@@ -70,7 +70,7 @@ echo -e "${GREEN}✓ GeoIP 数据库已上传${NC}"
 echo -e "${YELLOW}步骤 5: 重启服务...${NC}"
 ssh -p ${REMOTE_PORT} ${REMOTE_HOST} "
     echo '停止旧进程...'
-    sudo killall ip_traffic_monitor_cli || true
+    sudo killall -9 ip_traffic_monitor_cli || true
     cd ${REMOTE_DIR}
     echo '使用 nohup 启动新进程（含 GeoIP 地理位置信息）...'
     nohup sudo ./ip_traffic_monitor_cli \

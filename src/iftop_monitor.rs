@@ -1,6 +1,4 @@
 use crate::monitor::{TrafficMonitor, TrafficStats};
-use hex::decode;
-use procfs::process::Process;
 use std::collections::HashMap;
 use std::error::Error;
 use std::io::{BufRead, BufReader};
@@ -190,57 +188,4 @@ impl TrafficMonitor for IftopMonitor {
     }
 }
 
-/// 工具函数
-fn hex_to_ipv4(hex_str: &str) -> Option<Ipv4Addr> {
-    let bytes = decode(hex_str).ok()?;
-    if bytes.len() == 4 {
-        Some(Ipv4Addr::new(bytes[3], bytes[2], bytes[1], bytes[0]))
-    } else {
-        None
-    }
-}
 
-/// 根据连接信息查找PID
-pub fn find_pid_for_connection(remote_ip: &str) -> Option<i32> {
-    if let Ok(content) = std::fs::read_to_string("/proc/net/tcp") {
-        for line in content.lines().skip(1) {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 10 {
-                if let Some(remote_addr_parts) = parts[2].split(':').collect::<Vec<_>>().get(0) {
-                    if let Some(parsed_ip) = hex_to_ipv4(remote_addr_parts) {
-                        if parsed_ip.to_string() == remote_ip {
-                            if let Ok(inode) = parts[9].parse::<u32>() {
-                                return find_pid_by_inode(inode).map(|p| p as i32);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-fn find_pid_by_inode(inode: u32) -> Option<u32> {
-    std::fs::read_dir("/proc")
-        .ok()?
-        .flatten()
-        .find_map(|entry| {
-            let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
-            Process::new(pid as i32)
-                .ok()?
-                .fd()
-                .ok()?
-                .flatten()
-                .find_map(|fd| match &fd.target {
-                    procfs::process::FDTarget::Socket(socket_inode) => {
-                        if *socket_inode == inode as u64 {
-                            Some(pid)
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                })
-        })
-}

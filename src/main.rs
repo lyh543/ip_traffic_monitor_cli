@@ -5,7 +5,7 @@ mod bpftrace_monitor;
 use chrono::Local;
 use clap::Parser;
 use monitor::{TrafficMonitor, TrafficStats, format_bytes};
-use iftop_monitor::{IftopMonitor, find_pid_for_connection};
+use iftop_monitor::{IftopMonitor};
 use bpftrace_monitor::BpftraceMonitor;
 use std::thread;
 use std::time::Duration;
@@ -78,6 +78,17 @@ static IP_TRAFFIC_STATS: Lazy<IpTrafficStore> = Lazy::new(|| Arc::new(Mutex::new
 
 // IP 地理信息缓存（减少重复查询 GeoIP 数据库）
 static GEO_CACHE: Lazy<Mutex<HashMap<String, IpGeoInfo>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+// IP -> PID 缓存（减少 /proc 遍历），带时间戳实现 1 小时过期
+static PID_CACHE: Lazy<Mutex<HashMap<String, (Option<i32>, std::time::Instant)>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+// PID -> 进程名缓存（减少 /proc 文件读取）
+static PROCESS_NAME_CACHE: Lazy<Mutex<HashMap<i32, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+// /proc/net/tcp 缓存（减少文件读取）
+static TCP_CONNECTIONS_CACHE: Lazy<Mutex<(std::time::Instant, HashMap<String, u32>)>> = Lazy::new(|| {
+    Mutex::new((std::time::Instant::now(), HashMap::new()))
+});
 
 // IP 地理信息结构
 #[derive(Debug, Clone)]
@@ -311,6 +322,143 @@ fn run_monitor_cycle(monitor: &mut Box<dyn TrafficMonitor>, cycle_info: &str) ->
     Ok(())
 }
 
+// ==================== 带缓存的 PID 查询 ====================
+fn get_pid_for_ip(ip: &str) -> Option<i32> {
+    // 先检查 PID 缓存（1 小时有效期）
+    {
+        let mut cache = PID_CACHE.lock().unwrap();
+        if let Some((cached_pid, timestamp)) = cache.get(ip) {
+            // 检查缓存是否过期（1 小时 = 3600 秒）
+            if timestamp.elapsed().as_secs() < 3600 {
+                return *cached_pid;
+            } else {
+                // 缓存过期，移除旧数据
+                cache.remove(ip);
+            }
+        }
+    }
+    
+    // 更新 TCP 连接缓存（每 5 秒刷新一次）
+    let inode = {
+        let mut tcp_cache = TCP_CONNECTIONS_CACHE.lock().unwrap();
+        let now = std::time::Instant::now();
+        
+        // 如果缓存超过 5 秒，重新读取
+        if now.duration_since(tcp_cache.0).as_secs() >= 5 {
+            tcp_cache.1 = build_ip_to_inode_map();
+            tcp_cache.0 = now;
+        }
+        
+        tcp_cache.1.get(ip).copied()
+    };
+    
+    // 如果找到 inode，查询 PID
+    let pid = if let Some(inode) = inode {
+        find_pid_by_inode(inode).map(|p| p as i32)
+    } else {
+        None
+    };
+    
+    // 保存到缓存，带时间戳
+    {
+        let mut cache = PID_CACHE.lock().unwrap();
+        cache.insert(ip.to_string(), (pid, std::time::Instant::now()));
+    }
+    
+    pid
+}
+
+// 批量读取 /proc/net/tcp，建立 IP -> inode 映射
+fn build_ip_to_inode_map() -> HashMap<String, u32> {
+    use std::net::Ipv4Addr;
+    
+    let mut map = HashMap::new();
+    
+    if let Ok(content) = std::fs::read_to_string("/proc/net/tcp") {
+        for line in content.lines().skip(1) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 10 {
+                // 解析远程地址
+                if let Some(remote_addr) = parts.get(2) {
+                    if let Some(addr_part) = remote_addr.split(':').next() {
+                        // 将十六进制地址转换为 IP
+                        if let Ok(addr_num) = u32::from_str_radix(addr_part, 16) {
+                            let octets = [
+                                (addr_num & 0xFF) as u8,
+                                ((addr_num >> 8) & 0xFF) as u8,
+                                ((addr_num >> 16) & 0xFF) as u8,
+                                ((addr_num >> 24) & 0xFF) as u8,
+                            ];
+                            let ip = Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]);
+                            
+                            // 解析 inode
+                            if let Ok(inode) = parts[9].parse::<u32>() {
+                                map.insert(ip.to_string(), inode);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    map
+}
+
+// 通过 inode 查找 PID（从 iftop_monitor.rs 移到这里）
+fn find_pid_by_inode(inode: u32) -> Option<u32> {
+    use procfs::process::Process;
+    
+    std::fs::read_dir("/proc")
+        .ok()?
+        .flatten()
+        .find_map(|entry| {
+            let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
+            Process::new(pid as i32)
+                .ok()?
+                .fd()
+                .ok()?
+                .flatten()
+                .find_map(|fd| match &fd.target {
+                    procfs::process::FDTarget::Socket(socket_inode) => {
+                        if *socket_inode == inode as u64 {
+                            Some(pid)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                })
+        })
+}
+
+// 根据 PID 获取进程名称（带缓存）
+fn get_process_name(pid: i32) -> Option<String> {
+    // 先检查缓存
+    {
+        let cache = PROCESS_NAME_CACHE.lock().unwrap();
+        if let Some(name) = cache.get(&pid) {
+            return Some(name.clone());
+        }
+    }
+    
+    // 从 /proc 读取进程名
+    use procfs::process::Process;
+    let process_name = Process::new(pid)
+        .ok()?
+        .stat()
+        .ok()
+        .map(|stat| stat.comm)?;
+    
+    // 保存到缓存
+    {
+        let mut cache = PROCESS_NAME_CACHE.lock().unwrap();
+        cache.insert(pid, process_name.clone());
+    }
+    
+    Some(process_name)
+}
+
 // ==================== 主函数 ====================
 #[tokio::main]
 async fn main() -> Result<(), String> {
@@ -423,9 +571,13 @@ fn process_connections(connections: &HashMap<String, TrafficStats>) -> Result<()
         let mut sorted: Vec<_> = connections.iter().collect();
         sorted.sort_by(|a, b| (b.1.tx_bytes + b.1.rx_bytes).cmp(&(a.1.tx_bytes + a.1.rx_bytes)));
         
+        // 批量构建输出字符串，减少系统调用
+        let mut output = String::with_capacity(sorted.len() * 100);
+        
         for (ip, traffic) in sorted.iter() {
             if traffic.tx_bytes > 0 || traffic.rx_bytes > 0 {
-                let pid = find_pid_for_connection(ip);
+                let pid = get_pid_for_ip(ip);
+                let process_name = pid.and_then(|p| get_process_name(p));
                 
                 // 累加到全局统计
                 let global_entry = global_stats.entry(ip.to_string()).or_insert_with(TrafficStats::default);
@@ -434,15 +586,25 @@ fn process_connections(connections: &HashMap<String, TrafficStats>) -> Result<()
                 global_entry.tx_packets += traffic.tx_packets;
                 global_entry.rx_packets += traffic.rx_packets;
                 
-                println!("  IP: {} | TX: {} | RX: {} | 累计TX: {} | 累计RX: {} | PID: {}",
+                // 添加到输出字符串
+                use std::fmt::Write;
+                let process_info = match (pid, process_name) {
+                    (Some(p), Some(name)) => format!("{} ({})", p, name),
+                    (Some(p), None) => format!("{}", p),
+                    _ => "0".to_string(),
+                };
+                let _ = write!(output, "  IP: {} | TX: {} | RX: {} | 累计TX: {} | 累计RX: {} | PID: {}\n",
                        ip,
                        format_bytes(traffic.tx_bytes),
                        format_bytes(traffic.rx_bytes),
                        format_bytes(global_entry.tx_bytes),
                        format_bytes(global_entry.rx_bytes),
-                       pid.unwrap_or(0));
+                       process_info);
             }
         }
+        
+        // 一次性输出所有内容
+        print!("{}", output);
     } else {
         println!("[{}] 无活跃网络连接", Local::now().format("%H:%M:%S"));
     }
