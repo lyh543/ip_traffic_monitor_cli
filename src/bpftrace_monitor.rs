@@ -46,7 +46,7 @@ tracepoint:net:netif_receive_skb
     $saddr = $iph->saddr;
     $len = args->len;
     
-    @rx_bytes[ntop($saddr)] = sum($len);
+    @rx_bytes[$saddr] = sum($len);
 }}
 
 // 监控发送流量
@@ -57,7 +57,7 @@ tracepoint:net:net_dev_start_xmit
     $daddr = $iph->daddr;
     $len = args->len;
     
-    @tx_bytes[ntop($daddr)] = sum($len);
+    @tx_bytes[$daddr] = sum($len);
 }}
 
 interval:s:{} {{
@@ -175,13 +175,27 @@ interval:s:{} {{
             && line.contains("]:")
         {
             // 解析 bpftrace map 输出格式: @map_name[key]: value
-            // 例如: @tx_bytes[192.168.1.1]: 1234
+            // 例如: @tx_bytes[16777343]: 1234 (使用数字地址作为 key)
             if let Some(bracket_start) = line.find('[') {
                 if let Some(bracket_end) = line.find("]:") {
-                    let ip = &line[bracket_start + 1..bracket_end];
+                    let addr_str = &line[bracket_start + 1..bracket_end];
+                    
+                    // 将数字地址转换为 IP 字符串
+                    let ip = if let Ok(addr) = addr_str.parse::<u32>() {
+                        // 网络字节序转主机字节序并转换为 IP 字符串
+                        let octets = [
+                            (addr & 0xFF) as u8,
+                            ((addr >> 8) & 0xFF) as u8,
+                            ((addr >> 16) & 0xFF) as u8,
+                            ((addr >> 24) & 0xFF) as u8,
+                        ];
+                        format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3])
+                    } else {
+                        return;
+                    };
 
                     // 过滤无效 IP 地址
-                    if !Self::is_valid_ip(ip) {
+                    if !Self::is_valid_ip(&ip) {
                         return;
                     }
 

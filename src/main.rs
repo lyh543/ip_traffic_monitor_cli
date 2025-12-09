@@ -66,8 +66,8 @@ struct Cli {
 }
 
 // ==================== Prometheus Exporter 相关 ====================
-// 全局 GeoIP 数据库读取器
-static GEOIP_READER: Lazy<Mutex<Option<Reader<Vec<u8>>>>> = Lazy::new(|| Mutex::new(None));
+// 全局 GeoIP 数据库读取器（使用 mmap 减少内存占用）
+static GEOIP_READER: Lazy<Mutex<Option<Reader<memmap2::Mmap>>>> = Lazy::new(|| Mutex::new(None));
 
 // 全局退出标志
 static RUNNING: AtomicBool = AtomicBool::new(true);
@@ -75,6 +75,9 @@ static RUNNING: AtomicBool = AtomicBool::new(true);
 // 全局 IP 流量统计存储（IP -> 累计流量统计）
 type IpTrafficStore = Arc<Mutex<HashMap<String, TrafficStats>>>;
 static IP_TRAFFIC_STATS: Lazy<IpTrafficStore> = Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
+
+// IP 地理信息缓存（减少重复查询 GeoIP 数据库）
+static GEO_CACHE: Lazy<Mutex<HashMap<String, IpGeoInfo>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 // IP 地理信息结构
 #[derive(Debug, Clone)]
@@ -86,17 +89,32 @@ struct IpGeoInfo {
 }
 
 fn init_geoip_db(db_path: &str) -> Result<(), String> {
-    match Reader::open_readfile(db_path) {
-        Ok(reader) => {
-            *GEOIP_READER.lock().unwrap() = Some(reader);
-            println!("GeoIP 数据库加载成功: {}", db_path);
-            Ok(())
-        }
-        Err(e) => Err(format!("GeoIP 数据库加载失败: {}", e)),
-    }
+    use std::fs::File;
+    
+    // 使用 mmap 方式加载，大幅减少内存占用（按需加载页面）
+    let file = File::open(db_path)
+        .map_err(|e| format!("无法打开 GeoIP 数据库文件: {}", e))?;
+    
+    let mmap = unsafe { memmap2::Mmap::map(&file) }
+        .map_err(|e| format!("无法映射 GeoIP 数据库文件: {}", e))?;
+    
+    let reader = Reader::from_source(mmap)
+        .map_err(|e| format!("GeoIP 数据库加载失败: {}", e))?;
+    
+    *GEOIP_READER.lock().unwrap() = Some(reader);
+    println!("GeoIP 数据库加载成功（使用 mmap）: {}", db_path);
+    Ok(())
 }
 
 fn get_ip_geo_info(ip_str: &str) -> IpGeoInfo {
+    // 先检查缓存
+    {
+        let cache = GEO_CACHE.lock().unwrap();
+        if let Some(info) = cache.get(ip_str) {
+            return info.clone();
+        }
+    }
+    
     let default_info = IpGeoInfo {
         country: "Unknown".to_string(),
         province: "Unknown".to_string(),
@@ -118,7 +136,7 @@ fn get_ip_geo_info(ip_str: &str) -> IpGeoInfo {
     };
 
     // 查询 GeoIP 数据库
-    match reader.lookup::<geoip2::City>(ip) {
+    let info = match reader.lookup::<geoip2::City>(ip) {
         Ok(city) => {
             let country = if let Some(c) = &city.country {
                 if let Some(names) = &c.names {
@@ -174,8 +192,16 @@ fn get_ip_geo_info(ip_str: &str) -> IpGeoInfo {
                 isp,
             }
         }
-        Err(_) => default_info,
+        Err(_) => default_info.clone(),
+    };
+    
+    // 保存到缓存
+    {
+        let mut cache = GEO_CACHE.lock().unwrap();
+        cache.insert(ip_str.to_string(), info.clone());
     }
+    
+    info
 }
 
 #[derive(Clone)]

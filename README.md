@@ -188,8 +188,8 @@ sudo ./target/release/ip_traffic_monitor_cli -i eth0 -d 0 -p 9090 -t 10485760
 ## 依赖
 
 - iftop: 流量监控工具（内存占用约 7MB）
-- GeoIP2 数据库（可选）: IP 地理位置查询
-- bpftrace（可选）: 高级流量追踪（内存占用约 60MB）
+- GeoIP2 数据库（可选）: IP 地理位置查询（内存占用约 60MB）
+- bpftrace（可选）: 高级流量追踪（内存占用约 110MB）
 
 ## 架构说明
 

@@ -65,6 +65,7 @@ echo -e "${YELLOW}步骤 4: 上传 GeoIP 数据库...${NC}"
 rsync -avz -e "ssh -p ${REMOTE_PORT}" "./${GEOIP_DB}" "${REMOTE_HOST}:${REMOTE_DIR}/${GEOIP_DB}"
 echo -e "${GREEN}✓ GeoIP 数据库已上传${NC}"
 
+
 # 6. 停止旧进程并启动新进程
 echo -e "${YELLOW}步骤 5: 重启服务...${NC}"
 ssh -p ${REMOTE_PORT} ${REMOTE_HOST} "
