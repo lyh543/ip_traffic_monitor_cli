@@ -135,6 +135,8 @@ global:
 2. **内存占用**：长期运行可能累积大量 IP
    - 当前无过期机制，每个 IP 仅占用约 40-60 字节
    - 10 万个 IP 约占用 4-6 MB 内存
+   - 本程序基础内存占用：Rust 实现约 7MB
+   - 依赖工具内存占用：iftop 约 7MB，bpftrace 约 60MB（如使用）
 
 3. **Counter 重置**：Prometheus 需要处理 counter 重置
    - Prometheus 会自动检测并处理 counter 重置

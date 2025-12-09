@@ -73,6 +73,7 @@ ssh -p ${REMOTE_PORT} ${REMOTE_HOST} "
     cd ${REMOTE_DIR}
     echo '使用 nohup 启动新进程（含 GeoIP 地理位置信息）...'
     nohup sudo ./ip_traffic_monitor_cli \
+        --backend bpftrace \
         --iface eth0 \
         --duration 0 \
         --sample-interval 10 \
