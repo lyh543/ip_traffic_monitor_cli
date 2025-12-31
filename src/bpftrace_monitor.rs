@@ -46,10 +46,12 @@ tracepoint:net:netif_receive_skb
     $saddr = $iph->saddr;
     $len = args->len;
     
+    // 统计从远程IP接收的字节数（下行流量）
     @rx_bytes[$saddr] = sum($len);
 }}
 
-// 监控发送流量
+// 监控发送流量（上行）
+// net_dev_start_xmit: 网卡发送数据包时触发
 tracepoint:net:net_dev_start_xmit
 {{
     $skb = (struct sk_buff *)args->skbaddr;

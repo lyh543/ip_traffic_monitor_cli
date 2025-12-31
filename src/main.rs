@@ -237,8 +237,8 @@ fn get_ip_traffic_metrics(prometheus_export_threshold: u64) -> Result<String, St
     
     let mut output = String::new();
     
-    // TX 流量指标
-    output.push_str("# HELP ip_traffic_tx_bytes_total Total transmitted bytes per IP address\n");
+    // TX 流量指标（上行流量：本机发送到远程IP的字节数）
+    output.push_str("# HELP ip_traffic_tx_bytes_total Total transmitted bytes to remote IP address (egress/upload traffic)\n");
     output.push_str("# TYPE ip_traffic_tx_bytes_total counter\n");
     
     for (ip, traffic) in stats.iter() {
@@ -258,8 +258,8 @@ fn get_ip_traffic_metrics(prometheus_export_threshold: u64) -> Result<String, St
         ));
     }
     
-    // RX 流量指标
-    output.push_str("\n# HELP ip_traffic_rx_bytes_total Total received bytes per IP address\n");
+    // RX 流量指标（下行流量：从远程IP接收到本机的字节数）
+    output.push_str("\n# HELP ip_traffic_rx_bytes_total Total received bytes from remote IP address (ingress/download traffic)\n");
     output.push_str("# TYPE ip_traffic_rx_bytes_total counter\n");
     
     for (ip, traffic) in stats.iter() {
@@ -593,7 +593,7 @@ fn process_connections(connections: &HashMap<String, TrafficStats>) -> Result<()
                     (Some(p), None) => format!("{}", p),
                     _ => "0".to_string(),
                 };
-                let _ = write!(output, "  IP: {} | TX: {} | RX: {} | 累计TX: {} | 累计RX: {} | PID: {}\n",
+                let _ = write!(output, "  IP: {} | TX(上行): {} | RX(下行): {} | 累计TX: {} | 累计RX: {} | PID: {}\n",
                        ip,
                        format_bytes(traffic.tx_bytes),
                        format_bytes(traffic.rx_bytes),
